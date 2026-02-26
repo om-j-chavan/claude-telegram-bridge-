@@ -69,11 +69,14 @@ function extractOptions(cleanText) {
   const lines = cleanText.split('\n');
 
   for (const line of lines) {
-    // Match lines like "❯ 1. Yes" or "  2. Yes, allow all..." or "> 1. Yes"
-    const match = line.match(/^\s*[❯>]?\s*(\d+)\.\s+(.+)$/);
+    // Match lines like "❯ 1. Yes", "  2. Yes, allow all...", "> 1 Yes", "3 No"
+    // The period after the number is optional (can get stripped with ANSI codes)
+    const match = line.match(/^\s*[❯>]?\s*(\d+)\.?\s+(.+)$/);
     if (match) {
       const position = parseInt(match[1], 10);
       let label = match[2].trim();
+      // Skip lines that are clearly not options (too long, look like code/paths)
+      if (label.length > 100 || /^[\/\\]/.test(label)) continue;
 
       // Check if this option has a (shift+tab) hint
       const hasShiftTab = /\(shift\+tab\)/i.test(label);

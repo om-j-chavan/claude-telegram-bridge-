@@ -25,6 +25,9 @@ function createBot(config) {
 
   bot.on('polling_error', () => {});
 
+  // --- Auto mode state ---
+  let autoMode = false;
+
   // --- Commands ---
 
   bot.onText(/\/start/, (msg) => {
@@ -37,6 +40,7 @@ function createBot(config) {
       '📝 Type any message → sent as prompt to Claude',
       '🔘 Tap buttons → approve/deny permissions\n',
       '*Commands:*',
+      '/auto — Toggle auto-approve mode',
       '/esc — Send Escape',
       '/ctrl+c — Send Ctrl+C',
       '/enter — Send Enter',
@@ -46,7 +50,17 @@ function createBot(config) {
 
   bot.onText(/\/status/, (msg) => {
     if (msg.chat.id !== AUTHORIZED_CHAT_ID) return;
-    bot.sendMessage(msg.chat.id, '🟢 Bridge active');
+    const mode = autoMode ? '🤖 Auto-approve ON' : '🔘 Manual mode';
+    bot.sendMessage(msg.chat.id, `🟢 Bridge active\n${mode}`);
+  });
+
+  bot.onText(/\/auto/, (msg) => {
+    if (msg.chat.id !== AUTHORIZED_CHAT_ID) return;
+    autoMode = !autoMode;
+    const status = autoMode
+      ? '🤖 *Auto-approve ON*\nAll permissions will be auto-accepted (Yes).'
+      : '🔘 *Auto-approve OFF*\nYou will be prompted for each permission.';
+    bot.sendMessage(msg.chat.id, status, { parse_mode: 'Markdown' });
   });
 
   bot.onText(/\/esc/, (msg) => {
@@ -95,19 +109,13 @@ function createBot(config) {
 
     if (!onResponse) return;
 
-    // --- Keystroke mapping ---
-    // Claude Code's permission UI is a list selector:
-    //   ❯ 1. Yes              ← pre-selected, Enter confirms
-    //     2. Allow all...      ← (shift+tab) shortcut OR Down+Enter
-    //     3. No                ← navigate or Esc
-    //
-    // Action keys from prompt-parser:
-    //   pos_1     → Enter (first option, already selected)
-    //   pos_2     → Down + Enter
-    //   pos_3     → Down + Down + Enter
-    //   shift_tab → Shift+Tab shortcut
-    //   deny      → Escape
+    sendKeystroke(action);
+  });
 
+  /**
+   * Send the appropriate keystroke(s) to Claude Code's PTY
+   */
+  function sendKeystroke(action) {
     const ENTER = '\r';
     const ESC = '\x1b';
     const DOWN = '\x1b[B';
@@ -129,10 +137,9 @@ function createBot(config) {
         setTimeout(() => onResponse(ENTER), 150);
       }, 150);
     } else {
-      // Fallback — just Enter
       onResponse(ENTER);
     }
-  });
+  }
 
   // --- Text messages → Claude prompts ---
 
@@ -161,9 +168,21 @@ function createBot(config) {
     const target = sanitize(prompt.target, 100);
     const desc = sanitize(prompt.description, 200);
 
+    // Auto mode — auto-approve and just notify
+    if (autoMode) {
+      if (onResponse) {
+        onResponse('\r'); // Press Enter (Yes)
+      }
+      bot.sendMessage(AUTHORIZED_CHAT_ID,
+        `${icon} *${prompt.tool}*  \`${target}\`\n${desc}\n\n🤖 *Auto-approved*`, {
+        parse_mode: 'Markdown',
+      }).catch(() => {});
+      return;
+    }
+
+    // Manual mode — show buttons
     const text = `${icon} *${prompt.tool}*  \`${target}\`\n${desc}`;
 
-    // Build inline keyboard — one row of buttons
     const keyboard = {
       inline_keyboard: [
         prompt.options.map(opt => ({
@@ -183,11 +202,15 @@ function createBot(config) {
     bot.sendMessage(AUTHORIZED_CHAT_ID, text).catch(() => {});
   }
 
+  function isAutoMode() {
+    return autoMode;
+  }
+
   function stop() {
     bot.stopPolling();
   }
 
-  return { sendPrompt, sendNotification, stop };
+  return { sendPrompt, sendNotification, isAutoMode, stop };
 }
 
 module.exports = { createBot };
