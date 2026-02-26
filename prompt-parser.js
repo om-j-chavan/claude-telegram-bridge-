@@ -300,7 +300,7 @@ function createDetector(onPrompt, opts = {}) {
  */
 function createResponseTracker(onSummary, opts = {}) {
   const {
-    idleTimeout = 6000,     // Wait 6s of silence — batches prose into one message
+    idleTimeout = 3000,     // Wait 3s of silence — batches prose into one message
     minLength = 15,
     maxLength = 3000,
     sendCooldown = 3000,    // Don't send again within 3s of last send
@@ -318,22 +318,30 @@ function createResponseTracker(onSummary, opts = {}) {
   }
 
   // Noise patterns to reject
-  const NOISE_RE = /^(Ruminating|Thinking|Implementing|Smooshing|Enchanting|Spelunking|Pondering|Reasoning|Deliberating|Contemplating|Actualizing|Fermenting|Sock-hopping|Cogitating|Musing|Percolating)/i;
+  const NOISE_RE = /^(Ruminating|Thinking|Implementing|Smooshing|Enchanting|Spelunking|Pondering|Reasoning|Deliberating|Contemplating|Actualizing|Fermenting|Sock-hopping|Cogitating|Musing|Percolating|Quantumizing|Tempering|Deciphering|Scampering)/i;
   const TUI_RE = /^(Claude Code|Tip:|esc to interrupt|\? for shortcuts|accept edits|shift\+tab|ctrl\+.*to expand|Conversation compacted)/i;
   const TOOL_RE = /^(Read|Update|Write|Bash|Glob|Grep|WebFetch|WebSearch|NotebookEdit|Task|Skill|Searched for)\b/i;
 
+  // Placeholder for cursor-forward — used to detect prose word boundaries
+  const WORD_SEP = '\x01';
+
   /**
-   * Strip ANSI codes except cursor-forward \x1b[\d*C
+   * Strip all ANSI codes, replacing cursor-forward \x1b[\d*C with a placeholder.
    */
   function stripNonCursor(rawData) {
     let cleaned = rawData;
+    // Replace cursor-forward with placeholder FIRST (before other stripping)
+    cleaned = cleaned.replace(/\x1b\[\d*C/g, WORD_SEP);
+    // Now strip everything else
     cleaned = cleaned.replace(/\x1b\[\d*(?:;\d+)*m/g, '');
     cleaned = cleaned.replace(/\x1b\[\d+;\d+H/g, '\n');
     cleaned = cleaned.replace(/\x1b\[\d*[ABD]/g, '');
     cleaned = cleaned.replace(/\x1b\[\d*[JKX]/g, '');
-    cleaned = cleaned.replace(/\x1b\[\??\d*[a-bd-zG-Z]/g, '');
+    cleaned = cleaned.replace(/\x1b\[\??\d*[a-zA-Z]/g, '');
     cleaned = cleaned.replace(/\x1b\][^\x07]*\x07/g, '');
     cleaned = cleaned.replace(/\x1b\][^\x1b]*(?:\x1b\\)?/g, '');
+    // Clean any remaining bare escape chars
+    cleaned = cleaned.replace(/\x1b/g, '');
     return cleaned;
   }
 
@@ -357,6 +365,8 @@ function createResponseTracker(onSummary, opts = {}) {
     if (/Esc to cancel/i.test(text)) return true;
     if (/Tab to amend/i.test(text)) return true;
     if (TOOL_RE.test(text) && text.length < 80) return true;
+    if (/\bthinking\b/i.test(text) && text.length < 40) return true;
+    if (/\bthought for \d/i.test(text)) return true;
     return false;
   }
 
@@ -364,24 +374,22 @@ function createResponseTracker(onSummary, opts = {}) {
    * Extract prose text from cleaned data (ANSI stripped except [1C).
    */
   function findProse(cleaned) {
-    // Match sequences: word[1C]word[1C]word (2+ spacers = 3+ words)
-    // The trailing part captures everything after the last [1C] up to a newline or control char
-    const prosePattern = /(?:[\w',.\-:;!?()"\/`]+\x1b\[\d*C){2,}[\w',.\-:;!?()"\/`?]+[^\n\x1b]*/g;
+    // Match sequences: word{SEP}word{SEP}word (2+ separators = 3+ words)
+    // WORD_SEP (\x01) replaced cursor-forward codes in stripNonCursor
+    // Use broad word matching: any non-whitespace, non-newline, non-separator char
+    // This captures unicode chars like em dash —, quotes, etc.
+    const sep = '\\x01';
+    const wordChars = `[^\\s\\n\\x01]+`;
+    const prosePattern = new RegExp(
+      `(?:${wordChars}${sep}){2,}${wordChars}[^\\n\\x01]*`, 'g'
+    );
     const matches = cleaned.match(prosePattern) || [];
     const results = [];
 
     for (const match of matches) {
-      let text = match.replace(/\x1b\[\d*C/g, ' ').trim();
-
-      // Clean any remaining ANSI escape remnants
-      text = text.replace(/\x1b\[?[0-9;]*[a-zA-Z]/g, '');
-      // Remove bare cursor-forward remnants like "1C" glued to words (e.g. "1Cdid")
-      // These come from broken \x1b[1C sequences where \x1b[ was stripped
-      text = text.replace(/\[?\d{1,2}C(?=[a-zA-Z])/g, ' ');
-      text = text.replace(/(?:^|\s)\d{1,2}C(?=\s|$)/g, ' ');
-      // Remove [Xm patterns from ANSI leaks
-      text = text.replace(/\[\d+m/g, '');
-      // Clean up extra whitespace from removals
+      // Replace placeholder with spaces
+      let text = match.replace(/\x01/g, ' ').trim();
+      // Clean up extra whitespace
       text = text.replace(/\s{2,}/g, ' ').trim();
 
       if (text.length < 15) continue;

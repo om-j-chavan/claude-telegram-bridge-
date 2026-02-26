@@ -119,7 +119,7 @@ const responseTracker = createResponseTracker(
     bot.sendSummary(summary);
   },
   {
-    idleTimeout: 6000,
+    idleTimeout: 3000,
     minLength: 15,
     debugWrite: DEBUG ? debugWrite : null,
   }
