@@ -47,6 +47,8 @@ function getPermissionScore(cleanText) {
   if (TOOL_PATTERNS.some(p => p.test(cleanText))) score += 0.2;
   if (/during this session/i.test(cleanText)) score += 0.2;
   if (/don.?t ask again/i.test(cleanText)) score += 0.3;
+  if (/Esc to cancel/i.test(cleanText)) score += 0.2;
+  if (/from this project/i.test(cleanText)) score += 0.1;
 
   const actionPatterns = [/make this edit/i, /run this command/i, /create this file/i, /want to proceed/i];
   if (actionPatterns.some(p => p.test(cleanText))) score += 0.2;
