@@ -170,9 +170,12 @@ function createBot(config) {
 
     // Auto mode — auto-approve and just notify
     if (autoMode) {
-      if (onResponse) {
-        onResponse('\r'); // Press Enter (Yes)
-      }
+      // Small delay to ensure the PTY prompt is fully rendered before sending Enter
+      setTimeout(() => {
+        if (onResponse) {
+          onResponse('\r'); // Press Enter (Yes)
+        }
+      }, 200);
       bot.sendMessage(AUTHORIZED_CHAT_ID,
         `${icon} *${prompt.tool}*  \`${target}\`\n${desc}\n\n🤖 *Auto-approved*`, {
         parse_mode: 'Markdown',
@@ -198,6 +201,25 @@ function createBot(config) {
     }).catch(() => {});
   }
 
+  function sendSummary(text) {
+    // Truncate for Telegram's 4096 char limit
+    const maxLen = 3500;
+    let msg = text.length > maxLen ? text.substring(0, maxLen) + '...' : text;
+
+    // Escape markdown special chars in the summary text
+    msg = msg.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
+
+    bot.sendMessage(AUTHORIZED_CHAT_ID,
+      `📋 *Claude Response*\n\n${msg}`, {
+      parse_mode: 'MarkdownV2',
+    }).catch(() => {
+      // Fallback without markdown if escaping fails
+      bot.sendMessage(AUTHORIZED_CHAT_ID,
+        `📋 Claude Response\n\n${text.substring(0, 3500)}`
+      ).catch(() => {});
+    });
+  }
+
   function sendNotification(text) {
     bot.sendMessage(AUTHORIZED_CHAT_ID, text).catch(() => {});
   }
@@ -210,7 +232,7 @@ function createBot(config) {
     bot.stopPolling();
   }
 
-  return { sendPrompt, sendNotification, isAutoMode, stop };
+  return { sendPrompt, sendSummary, sendNotification, isAutoMode, stop };
 }
 
 module.exports = { createBot };

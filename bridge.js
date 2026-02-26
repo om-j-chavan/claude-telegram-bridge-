@@ -22,7 +22,7 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const pty = require('node-pty');
-const { createDetector } = require('./prompt-parser');
+const { createDetector, createResponseTracker } = require('./prompt-parser');
 const { createBot } = require('./telegram-bot');
 
 // --- Parse CLI args ---
@@ -94,6 +94,8 @@ const bot = createBot({
     }
     // Clear dedup so next prompt isn't skipped
     detector.clearLastPrompt();
+    // Reset prose accumulator so response starts fresh after approval
+    responseTracker.reset();
   },
   onMessage: (text) => {
     debugWrite('telegram-message', text);
@@ -110,10 +112,25 @@ const bot = createBot({
   },
 });
 
+// --- Initialize response tracker (captures Claude's output after tool execution) ---
+const responseTracker = createResponseTracker(
+  (summary) => {
+    debugWrite('response-summary', summary.substring(0, 200));
+    bot.sendSummary(summary);
+  },
+  {
+    idleTimeout: 6000,
+    minLength: 15,
+    debugWrite: DEBUG ? debugWrite : null,
+  }
+);
+
 // --- Initialize prompt detector ---
 const detector = createDetector(
   (prompt) => {
     debugWrite('prompt-detected', JSON.stringify(prompt));
+    // Disarm response tracker — new permission prompt means previous response is done
+    responseTracker.reset();
     bot.sendPrompt(prompt);
   },
   {
@@ -170,6 +187,9 @@ claudeProcess.onData((data) => {
   // Feed to prompt detector
   detector.feed(data);
 
+  // Feed to response tracker (captures output after tool execution)
+  responseTracker.feed(data);
+
   // Debug log
   debugWrite('pty-output', data.replace(/\n/g, '\\n'));
 });
@@ -213,6 +233,7 @@ function cleanup() {
   console.log('\n[bridge] Shutting down...');
 
   detector.reset();
+  responseTracker.reset();
   bot.stop();
 
   if (debugLog) {

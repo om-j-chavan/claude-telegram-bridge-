@@ -197,7 +197,7 @@ function createDetector(onPrompt, opts = {}) {
   let idleTimer = null;
   let lastPromptTime = 0;
   let lastPromptDescription = '';
-  const COOLDOWN_MS = 2000;
+  const COOLDOWN_MS = 1000;  // Reduced from 2s to 1s for faster auto-approve chains
 
   function log(msg) {
     if (debugWrite) debugWrite('prompt-parser', msg);
@@ -286,4 +286,227 @@ function createDetector(onPrompt, opts = {}) {
   return { feed, reset, clearLastPrompt };
 }
 
-module.exports = { createDetector, parsePrompt, getPermissionScore, extractOptions };
+/**
+ * Creates a response tracker that extracts Claude's prose text from PTY output.
+ *
+ * Claude Code renders prose text with \x1b[1C (cursor-forward-1) between words:
+ *   ●[m[1CThis[1Cis[1CClaude's[1Cresponse
+ * becomes: "This is Claude's response"
+ *
+ * This tracker extracts those prose segments in real-time, rather than
+ * trying to clean the full raw buffer after the fact.
+ */
+function createResponseTracker(onSummary, opts = {}) {
+  const {
+    idleTimeout = 6000,     // Wait 6s of silence — batches prose into one message
+    minLength = 15,
+    maxLength = 3000,
+    sendCooldown = 3000,    // Don't send again within 3s of last send
+    debugWrite = null,
+  } = opts;
+
+  let proseLines = [];      // Extracted prose text lines
+  let idleTimer = null;
+  let overlapBuffer = '';    // Tail of previous chunk for cross-chunk matching
+  let lastSendTime = 0;
+  let lastExtracted = '';    // Last extracted text to avoid overlap duplicates
+
+  function log(msg) {
+    if (debugWrite) debugWrite('response-tracker', msg);
+  }
+
+  // Noise patterns to reject
+  const NOISE_RE = /^(Ruminating|Thinking|Implementing|Smooshing|Enchanting|Spelunking|Pondering|Reasoning|Deliberating|Contemplating|Actualizing|Fermenting|Sock-hopping|Cogitating|Musing|Percolating)/i;
+  const TUI_RE = /^(Claude Code|Tip:|esc to interrupt|\? for shortcuts|accept edits|shift\+tab|ctrl\+.*to expand|Conversation compacted)/i;
+  const TOOL_RE = /^(Read|Update|Write|Bash|Glob|Grep|WebFetch|WebSearch|NotebookEdit|Task|Skill|Searched for)\b/i;
+
+  /**
+   * Strip ANSI codes except cursor-forward \x1b[\d*C
+   */
+  function stripNonCursor(rawData) {
+    let cleaned = rawData;
+    cleaned = cleaned.replace(/\x1b\[\d*(?:;\d+)*m/g, '');
+    cleaned = cleaned.replace(/\x1b\[\d+;\d+H/g, '\n');
+    cleaned = cleaned.replace(/\x1b\[\d*[ABD]/g, '');
+    cleaned = cleaned.replace(/\x1b\[\d*[JKX]/g, '');
+    cleaned = cleaned.replace(/\x1b\[\??\d*[a-bd-zG-Z]/g, '');
+    cleaned = cleaned.replace(/\x1b\][^\x07]*\x07/g, '');
+    cleaned = cleaned.replace(/\x1b\][^\x1b]*(?:\x1b\\)?/g, '');
+    return cleaned;
+  }
+
+  /**
+   * Check if text should be filtered as noise
+   */
+  function isNoise(text) {
+    if (NOISE_RE.test(text)) return true;
+    if (TUI_RE.test(text)) return true;
+    if (/accept edits on/i.test(text)) return true;
+    if (/tab to cycle/i.test(text)) return true;
+    if (/esc to interrupt/i.test(text)) return true;
+    if (/shift\+tab/i.test(text)) return true;
+    if (/ctrl\+[a-z] to/i.test(text)) return true;
+    if (/lines?, removed/i.test(text)) return true;
+    if (/Added \d+ lines/i.test(text)) return true;
+    if (/do you want to/i.test(text)) return true;
+    if (/allow all .* during this session/i.test(text)) return true;
+    if (/allow reading from/i.test(text)) return true;
+    if (/allow .* from this project/i.test(text)) return true;
+    if (/Esc to cancel/i.test(text)) return true;
+    if (/Tab to amend/i.test(text)) return true;
+    if (TOOL_RE.test(text) && text.length < 80) return true;
+    return false;
+  }
+
+  /**
+   * Extract prose text from cleaned data (ANSI stripped except [1C).
+   */
+  function findProse(cleaned) {
+    // Match sequences: word[1C]word[1C]word (2+ spacers = 3+ words)
+    // The trailing part captures everything after the last [1C] up to a newline or control char
+    const prosePattern = /(?:[\w',.\-:;!?()"\/`]+\x1b\[\d*C){2,}[\w',.\-:;!?()"\/`?]+[^\n\x1b]*/g;
+    const matches = cleaned.match(prosePattern) || [];
+    const results = [];
+
+    for (const match of matches) {
+      let text = match.replace(/\x1b\[\d*C/g, ' ').trim();
+
+      // Clean any remaining ANSI escape remnants
+      text = text.replace(/\x1b\[?[0-9;]*[a-zA-Z]/g, '');
+      // Remove bare cursor-forward remnants like "1C" glued to words (e.g. "1Cdid")
+      // These come from broken \x1b[1C sequences where \x1b[ was stripped
+      text = text.replace(/\[?\d{1,2}C(?=[a-zA-Z])/g, ' ');
+      text = text.replace(/(?:^|\s)\d{1,2}C(?=\s|$)/g, ' ');
+      // Remove [Xm patterns from ANSI leaks
+      text = text.replace(/\[\d+m/g, '');
+      // Clean up extra whitespace from removals
+      text = text.replace(/\s{2,}/g, ' ').trim();
+
+      if (text.length < 15) continue;
+      if (isNoise(text)) continue;
+      results.push(text);
+    }
+
+    return results;
+  }
+
+  /**
+   * Feed raw PTY output data.
+   * Always monitors — no need to "arm".
+   */
+  function feed(rawData) {
+    // Combine with overlap from previous chunk to catch cross-chunk prose
+    const combined = overlapBuffer + rawData;
+
+    // Save last 200 chars as overlap for next chunk
+    overlapBuffer = rawData.length > 200 ? rawData.slice(-200) : rawData;
+
+    // Strip non-cursor ANSI from combined data
+    const cleaned = stripNonCursor(combined);
+
+    // Extract prose
+    const extracted = findProse(cleaned);
+
+    if (extracted.length > 0) {
+      for (const line of extracted) {
+        // Skip if this was already extracted (overlap duplicate)
+        if (lastExtracted && lastExtracted.includes(line)) continue;
+
+        // Avoid adding duplicates from overlap matching
+        const isDup = proseLines.some(existing =>
+          existing.includes(line) || line.includes(existing)
+        );
+        if (!isDup) {
+          proseLines.push(line);
+          log(`Extracted: "${line.substring(0, 120)}"`);
+        } else {
+          // Replace shorter with longer
+          const idx = proseLines.findIndex(existing => line.includes(existing) && line.length > existing.length);
+          if (idx >= 0) {
+            proseLines[idx] = line;
+            log(`Extended: "${line.substring(0, 120)}"`);
+          }
+        }
+
+        lastExtracted = line;
+      }
+
+      // Cap accumulated lines
+      if (proseLines.length > 50) {
+        proseLines = proseLines.slice(-30);
+      }
+    }
+
+    // Reset idle timer
+    if (idleTimer) clearTimeout(idleTimer);
+
+    idleTimer = setTimeout(() => {
+      if (proseLines.length === 0) return;
+
+      // Send cooldown — avoid sending two summaries too close together
+      const now = Date.now();
+      if (now - lastSendTime < sendCooldown) {
+        log(`Cooldown active (${Math.round((sendCooldown - (now - lastSendTime)) / 1000)}s left), deferring`);
+        // Re-arm the timer to try again later
+        idleTimer = setTimeout(() => {
+          if (proseLines.length === 0) return;
+          sendAccumulated();
+        }, sendCooldown - (now - lastSendTime) + 1000);
+        return;
+      }
+
+      sendAccumulated();
+    }, idleTimeout);
+  }
+
+  function sendAccumulated() {
+    if (proseLines.length === 0) return;
+
+    // Deduplicate — merge overlapping lines
+    const deduped = [];
+    for (const line of proseLines) {
+      if (deduped.length > 0) {
+        const prev = deduped[deduped.length - 1];
+        if (prev.includes(line) || line.includes(prev)) {
+          if (line.length > prev.length) deduped[deduped.length - 1] = line;
+          continue;
+        }
+      }
+      deduped.push(line);
+    }
+
+    const summary = deduped.join('\n').trim();
+    proseLines = [];
+    lastSendTime = Date.now();
+
+    if (summary.length < minLength) {
+      log(`Summary too short (${summary.length} chars), skipping`);
+      return;
+    }
+
+    const truncated = summary.length > maxLength
+      ? summary.substring(0, maxLength) + '...'
+      : summary;
+
+    log(`Sending summary (${truncated.length} chars)`);
+    onSummary(truncated);
+  }
+
+  function reset() {
+    proseLines = [];
+    overlapBuffer = '';
+    lastExtracted = '';
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  }
+
+  function arm() {
+    log('Armed (always-on mode)');
+  }
+
+  return { arm, feed, reset };
+}
+
+module.exports = { createDetector, createResponseTracker, parsePrompt, getPermissionScore, extractOptions };

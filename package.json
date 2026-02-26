@@ -1,6 +1,6 @@
 {
   "name": "claude-telegram-bridge",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Remote permission approval for Claude Code via Telegram",
   "main": "bridge.js",
   "scripts": {
