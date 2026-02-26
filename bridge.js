@@ -92,6 +92,8 @@ const bot = createBot({
     if (claudeProcess) {
       claudeProcess.write(keystroke);
     }
+    // Clear dedup so next prompt isn't skipped
+    detector.clearLastPrompt();
   },
   onMessage: (text) => {
     debugWrite('telegram-message', text);
@@ -115,7 +117,7 @@ const detector = createDetector(
     bot.sendPrompt(prompt);
   },
   {
-    idleTimeout: 800,
+    idleTimeout: 300,
     scoreThreshold: 0.5,
     debugWrite: DEBUG ? debugWrite : null,
   }

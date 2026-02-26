@@ -3,21 +3,8 @@ const { stripCodes } = require('./sanitizer');
 /**
  * Prompt Parser for Claude Code permission requests.
  *
- * Claude Code permission prompts look like:
- *
- *   Do you want to make this edit to src/file.ts?
- *     1. Yes
- *     2. Yes, allow all edits during this session (shift+tab)
- *   > 3. Yes, allow all edits during this session
- *
- *   Do you want to run this command?
- *     1. Yes
- *     2. Yes, allow all commands during this session
- *
- * This parser uses pattern matching + idle detection:
- *   1. Buffer PTY output and strip ANSI codes
- *   2. Score text for permission-prompt likelihood
- *   3. After idle period (Claude is waiting), confirm and send to Telegram
+ * Detects permission prompts in terminal output and extracts the actual
+ * options shown to the user. Uses pattern matching + idle detection.
  */
 
 // Strong indicators — Claude Code's actual prompt patterns
@@ -27,11 +14,9 @@ const PROMPT_PATTERNS = [
   /make this edit/i,
   /run this command/i,
   /create this file/i,
-  /allow all edits/i,
-  /allow all commands/i,
-  /allow all writes/i,
+  /allow all/i,
   /during this session/i,
-  /don't ask again/i,
+  /don.?t ask again/i,
 ];
 
 // Tool name patterns
@@ -40,7 +25,7 @@ const TOOL_PATTERNS = [
 ];
 
 // Numbered options — very strong indicator
-const NUMBERED_OPTION_RE = /^\s*>?\s*[1-3]\.\s*(Yes|No)/m;
+const NUMBERED_OPTION_RE = /^\s*>?\s*[1-4]\.\s*(Yes|No)/m;
 
 // Tool name extraction
 const TOOL_NAME_RE = /\b(Edit|Write|Bash|Read|Glob|Grep|WebFetch|WebSearch|NotebookEdit|Task|Skill)\b/i;
@@ -48,7 +33,7 @@ const TOOL_NAME_RE = /\b(Edit|Write|Bash|Read|Glob|Grep|WebFetch|WebSearch|Noteb
 // File path extraction
 const FILE_PATH_RE = /(?:[A-Za-z]:)?(?:[\/\\])[\w.\/\\@-]+\.\w+/;
 
-// Bash command extraction — look for command after "Bash" tool indicator
+// Bash command extraction
 const BASH_CMD_RE = /(?:Bash|command|cmd|run)[:\s(]*[`"]?(.+?)[`")]*$/im;
 
 /**
@@ -57,38 +42,50 @@ const BASH_CMD_RE = /(?:Bash|command|cmd|run)[:\s(]*[`"]?(.+?)[`")]*$/im;
 function getPermissionScore(cleanText) {
   let score = 0;
 
-  // Check for Claude Code's "Do you want to..." pattern (strongest signal)
-  if (/do you want to/i.test(cleanText)) {
-    score += 0.4;
-  }
+  if (/do you want to/i.test(cleanText)) score += 0.4;
+  if (NUMBERED_OPTION_RE.test(cleanText)) score += 0.4;
+  if (TOOL_PATTERNS.some(p => p.test(cleanText))) score += 0.2;
+  if (/during this session/i.test(cleanText)) score += 0.2;
+  if (/don.?t ask again/i.test(cleanText)) score += 0.3;
 
-  // Check for numbered Yes/No options
-  if (NUMBERED_OPTION_RE.test(cleanText)) {
-    score += 0.4;
-  }
-
-  // Check for tool name mention
-  if (TOOL_PATTERNS.some(p => p.test(cleanText))) {
-    score += 0.2;
-  }
-
-  // Check for session-allow patterns
-  if (/during this session/i.test(cleanText)) {
-    score += 0.2;
-  }
-
-  // Check for specific action phrases
   const actionPatterns = [/make this edit/i, /run this command/i, /create this file/i, /want to proceed/i];
-  if (actionPatterns.some(p => p.test(cleanText))) {
-    score += 0.2;
-  }
-
-  // "don't ask again" is unique to permission prompts
-  if (/don't ask again/i.test(cleanText)) {
-    score += 0.3;
-  }
+  if (actionPatterns.some(p => p.test(cleanText))) score += 0.2;
 
   return Math.min(score, 1.0);
+}
+
+/**
+ * Extract the actual numbered options from Claude Code's prompt.
+ *
+ * Parses lines like:
+ *   ❯ 1. Yes
+ *     2. Yes, allow all edits during this session (shift+tab)
+ *     3. No
+ *
+ * Returns array of { position, label, hasShiftTab }
+ */
+function extractOptions(cleanText) {
+  const options = [];
+  const lines = cleanText.split('\n');
+
+  for (const line of lines) {
+    // Match lines like "❯ 1. Yes" or "  2. Yes, allow all..." or "> 1. Yes"
+    const match = line.match(/^\s*[❯>]?\s*(\d+)\.\s+(.+)$/);
+    if (match) {
+      const position = parseInt(match[1], 10);
+      let label = match[2].trim();
+
+      // Check if this option has a (shift+tab) hint
+      const hasShiftTab = /\(shift\+tab\)/i.test(label);
+
+      // Clean up the label — remove keyboard hints like (shift+tab)
+      label = label.replace(/\s*\(shift\+tab\)\s*/gi, '').trim();
+
+      options.push({ position, label, hasShiftTab });
+    }
+  }
+
+  return options;
 }
 
 /**
@@ -109,14 +106,9 @@ function parsePrompt(cleanText) {
 
   // Extract file path
   const fileMatch = cleanText.match(FILE_PATH_RE);
-
-  // Extract bash command
   const cmdMatch = cleanText.match(BASH_CMD_RE);
-
-  // Extract filename from "edit to <filename>?" pattern
   const editToMatch = cleanText.match(/(?:edit to|write to|create)\s+(\S+?)[\s?]/i);
 
-  // Determine target
   let target = 'N/A';
   if (detectedTool.toLowerCase() === 'bash' && cmdMatch) {
     target = cmdMatch[1].substring(0, 100);
@@ -126,7 +118,7 @@ function parsePrompt(cleanText) {
     target = editToMatch[1];
   }
 
-  // Extract description — find the "Do you want to..." line
+  // Extract description
   const lines = cleanText.split('\n').filter(l => l.trim().length > 0);
   let description = '';
   for (const line of lines) {
@@ -137,39 +129,59 @@ function parsePrompt(cleanText) {
     }
   }
 
-  // Claude Code uses numbered options: 1, 2, 3
-  // 1 = Yes (allow once)
-  // 2 = Yes, allow all [type] during this session
-  // 3 = Yes, allow all [type] during this session (sometimes)
-  // Esc = Cancel/Deny
-  const options = [
-    { key: '1', label: '1. Yes (once)' },
-    { key: '2', label: '2. Allow all (session)' },
-    { key: '\x1b', label: 'Esc (deny)' },
-  ];
+  // Extract actual options from the prompt text
+  const extractedOptions = extractOptions(cleanText);
+
+  // Build Telegram button options from extracted options
+  let telegramOptions;
+
+  if (extractedOptions.length >= 2) {
+    // Use the actual options from Claude's prompt
+    telegramOptions = extractedOptions.map(opt => {
+      // Determine the action key based on position and content
+      let actionKey;
+
+      if (opt.position === 1) {
+        // First option — always "yes" (Enter to confirm default)
+        actionKey = `pos_1`;
+      } else if (opt.hasShiftTab) {
+        // Has shift+tab shortcut
+        actionKey = `shift_tab`;
+      } else if (/^no$/i.test(opt.label)) {
+        // "No" option — use Escape
+        actionKey = `deny`;
+      } else {
+        // Other options — navigate with Down arrows
+        actionKey = `pos_${opt.position}`;
+      }
+
+      return { key: actionKey, label: opt.label };
+    });
+
+    // Always add Deny/Esc if not already present as a "No" option
+    const hasNo = telegramOptions.some(o => o.key === 'deny');
+    if (!hasNo) {
+      telegramOptions.push({ key: 'deny', label: 'Cancel (Esc)' });
+    }
+  } else {
+    // Fallback — couldn't parse options
+    telegramOptions = [
+      { key: 'pos_1', label: 'Yes' },
+      { key: 'deny', label: 'No / Cancel' },
+    ];
+  }
 
   return {
     tool: detectedTool,
     target,
     description: description || `${detectedTool} action requested`,
-    options,
+    options: telegramOptions,
     rawText: cleanText.substring(0, 1000),
   };
 }
 
 /**
  * Creates a prompt detector with idle-timeout confirmation.
- *
- * Feed PTY output chunks via `feed(data)`. When a permission prompt
- * is detected and output goes idle, `onPrompt` fires.
- *
- * All debug output goes to the debugWrite callback (file only, never stdout).
- *
- * @param {Function} onPrompt - Called with parsed prompt object
- * @param {Object} opts
- * @param {number} opts.idleTimeout - Ms of silence before confirming (default: 800)
- * @param {number} opts.scoreThreshold - Min score to trigger (default: 0.5)
- * @param {Function} opts.debugWrite - Optional function(label, msg) for debug logging
  */
 function createDetector(onPrompt, opts = {}) {
   const {
@@ -181,27 +193,36 @@ function createDetector(onPrompt, opts = {}) {
   let buffer = '';
   let idleTimer = null;
   let lastPromptTime = 0;
-  const COOLDOWN_MS = 1000; // Short cooldown — prompts can come back-to-back
+  let lastPromptDescription = '';
+  const COOLDOWN_MS = 2000;
 
   function log(msg) {
     if (debugWrite) debugWrite('prompt-parser', msg);
   }
 
+  function isJustAnimation(text) {
+    const stripped = text
+      .replace(/[✶✻✽✢·●*❯⠂⠐⠈⠠⠄⠁⠃⠇⠋⠙⠸⠴⠦⠖⠒⠑⠘⠰⠤⠆⠊⠃]/g, '')
+      .replace(/\b(Implementing|Smooshing|Enchanting|Running|Thinking|Reading|Writing|Searching|Analyzing|Processing)[\w\s…]*\b/gi, '')
+      .replace(/\d+\s*(tool uses|tokens|files?|s\b)/g, '')
+      .replace(/[─╌│├└┘┐┌┤┬┴┼─]+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return stripped.length < 20;
+  }
+
   function feed(rawData) {
     buffer += rawData;
 
-    // Keep buffer bounded
     if (buffer.length > 20000) {
       buffer = buffer.slice(-10000);
     }
 
-    // Clear pending idle timer — new data arrived
     if (idleTimer) {
       clearTimeout(idleTimer);
       idleTimer = null;
     }
 
-    // Check recent output for permission patterns
     const recentRaw = buffer.slice(-3000);
     const recentClean = stripCodes(recentRaw);
     const score = getPermissionScore(recentClean);
@@ -211,7 +232,6 @@ function createDetector(onPrompt, opts = {}) {
     }
 
     if (score >= scoreThreshold) {
-      // Potential prompt — wait for idle to confirm
       idleTimer = setTimeout(() => {
         const now = Date.now();
         if (now - lastPromptTime < COOLDOWN_MS) {
@@ -219,14 +239,27 @@ function createDetector(onPrompt, opts = {}) {
           return;
         }
 
-        // Re-check after idle
         const finalClean = stripCodes(buffer.slice(-3000));
         const finalScore = getPermissionScore(finalClean);
 
         if (finalScore >= scoreThreshold) {
-          lastPromptTime = now;
+          if (isJustAnimation(finalClean)) {
+            log('Skipping — animation-only output');
+            return;
+          }
+
           const prompt = parsePrompt(finalClean);
+
+          const promptKey = `${prompt.tool}:${prompt.target}:${prompt.description}`;
+          if (promptKey === lastPromptDescription) {
+            log(`Skipping duplicate: ${promptKey}`);
+            return;
+          }
+
+          lastPromptTime = now;
+          lastPromptDescription = promptKey;
           log(`CONFIRMED (score=${finalScore.toFixed(2)}): ${prompt.tool} -> ${prompt.target}`);
+          log(`Options: ${JSON.stringify(prompt.options)}`);
           onPrompt(prompt);
           buffer = '';
         }
@@ -236,13 +269,18 @@ function createDetector(onPrompt, opts = {}) {
 
   function reset() {
     buffer = '';
+    lastPromptDescription = '';
     if (idleTimer) {
       clearTimeout(idleTimer);
       idleTimer = null;
     }
   }
 
-  return { feed, reset };
+  function clearLastPrompt() {
+    lastPromptDescription = '';
+  }
+
+  return { feed, reset, clearLastPrompt };
 }
 
-module.exports = { createDetector, parsePrompt, getPermissionScore };
+module.exports = { createDetector, parsePrompt, getPermissionScore, extractOptions };
